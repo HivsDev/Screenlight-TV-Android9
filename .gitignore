@@ -1,0 +1,6 @@
+/build/
+/apktool/build/
+/signing/*.keystore
+/apktool/assets/*.pk8
+*.apk
+*.idsig
