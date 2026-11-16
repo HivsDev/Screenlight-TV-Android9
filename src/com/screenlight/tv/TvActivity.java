@@ -1,4 +1,4 @@
-package com.tg666.tv;
+package com.screenlight.tv;
 
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -12,6 +12,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.text.Html;
 import android.text.TextUtils;
+import android.util.Log;
 import android.util.LruCache;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -84,6 +85,7 @@ public final class TvActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        LegacyTls.install(this);
         setTitle("暮光TV");
         getWindow().getDecorView().setSystemUiVisibility(5894 | 1024 | 512);
         page = new LinearLayout(this);
@@ -100,6 +102,15 @@ public final class TvActivity extends Activity {
         content.setOrientation(LinearLayout.VERTICAL);
         scroll.addView(content);
         showHome();
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if ("detail".equals(mode) && detailInfo != null && detailSources != null) {
+            sourceIndex = PlaybackState.sourceIndex(detailSources,
+                PlaybackState.load(this, detailInfo.optInt("vod_id")));
+            renderDetail();
+        }
     }
 
     private void buildNav() {
@@ -139,7 +150,7 @@ public final class TvActivity extends Activity {
         activeNav = index;
         updateNav();
         if (index == 0) showHome();
-        else if (index <= 5) showCategory(index);
+        else if (index <= 5) { currentCategory = -1; showCategory(index); }
         else if (index == 6) showRanking();
         else if (index == 7) { searchText = ""; searchResults = null; showSearch(); }
         else showHistory();
@@ -220,6 +231,7 @@ public final class TvActivity extends Activity {
             categoryVideos = null;
             filterOptions = null;
             for (int i = 0; i < filterSelection.length; i++) filterSelection[i] = 0;
+            filterSelection[0] = 1;
         }
         begin("category");
         if (filterOptions != null) {
@@ -508,21 +520,21 @@ public final class TvActivity extends Activity {
         query.setBackground(drawable(PANEL, MUTED, 4));
         query.setPadding(dp(14), 0, dp(14), 0);
         controls.addView(query, new LinearLayout.LayoutParams(0, dp(50), 1));
-        TextView clear = button("清空", false);
-        LinearLayout.LayoutParams clearLp = new LinearLayout.LayoutParams(dp(88), dp(50));
-        clearLp.leftMargin = dp(12);
-        controls.addView(clear, clearLp);
-        clear.setGravity(Gravity.CENTER);
-        clear.setOnClickListener(v -> { searchText = ""; searchResults = null; showSearch(); });
         TextView go = button("搜索", false);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(100), dp(50));
         lp.leftMargin = dp(12);
         controls.addView(go, lp);
         go.setGravity(Gravity.CENTER);
+        TextView clear = button("清除", false);
+        LinearLayout.LayoutParams clearLp = new LinearLayout.LayoutParams(dp(88), dp(50));
+        clearLp.leftMargin = dp(12);
+        controls.addView(clear, clearLp);
+        clear.setGravity(Gravity.CENTER);
+        clear.setOnClickListener(v -> { searchText = ""; searchResults = null; showSearch(); });
         List<View> row = new ArrayList<>();
         row.add(query);
-        row.add(clear);
         row.add(go);
+        row.add(clear);
         focusRows.add(row);
         wireFocus();
         go.setOnClickListener(v -> {
@@ -599,8 +611,16 @@ public final class TvActivity extends Activity {
                 if (api == null) api = new TvApi(this);
                 JSONObject payload = api.get("video_detail?id=" + id);
                 JSONObject info = payload.getJSONObject("data").getJSONObject("vod_info");
-                main.post(() -> { if (task == generation) { detailInfo = info; detailSources = info.optJSONArray("vod_url_with_player"); sourceIndex = 0; renderDetail(); } });
-            } catch (Exception error) { main.post(() -> { if (task == generation) errorState("详情加载失败", () -> openDetail(video)); }); }
+                main.post(() -> { if (task == generation) {
+                    detailInfo = info;
+                    detailSources = info.optJSONArray("vod_url_with_player");
+                    sourceIndex = PlaybackState.sourceIndex(detailSources, PlaybackState.load(this, id));
+                    renderDetail();
+                } });
+            } catch (Exception error) {
+                Log.w("ScreenlightTV", "Detail request failed for video " + id, error);
+                main.post(() -> { if (task == generation) errorState("详情加载失败", () -> openDetail(video)); });
+            }
         });
     }
 
@@ -664,6 +684,24 @@ public final class TvActivity extends Activity {
                 sourceFocus.add(sourceButton);
             }
         }
+        JSONObject saved = PlaybackState.load(this, detailInfo.optInt("vod_id"));
+        if (saved.optInt("position_ms") > 5000 && detailSources != null && detailSources.length() > 0
+            && sourceIndex == PlaybackState.sourceIndex(detailSources, saved)) {
+            JSONObject savedSource = detailSources.optJSONObject(sourceIndex);
+            String[] savedEntries = savedSource == null ? new String[0] : savedSource.optString("url").split("#");
+            if (savedEntries.length > 0) {
+                int savedEpisode = PlaybackState.episodeIndex(savedEntries, saved);
+                String[] selected = savedEntries[savedEpisode].split("\\$", 2);
+                String savedUrl = selected.length == 2 ? selected[1] : selected[0];
+                String savedName = selected.length == 2 ? selected[0] : "播放";
+                if (!savedUrl.isEmpty()) {
+                    TextView resume = button("继续播放 " + formatTime(saved.optInt("position_ms")), false);
+                    resume.setOnClickListener(v -> launchPlayer(savedUrl, savedName, savedSource));
+                    sourcesRow.addView(resume, bottomMargin(-2, dp(42), 0));
+                    sourceFocus.add(resume);
+                }
+            }
+        }
         focusRows.add(sourceFocus);
         heading("选集");
         if (detailSources == null || detailSources.length() == 0) { status("暂无播放线路"); wireFocus(); return; }
@@ -717,6 +755,8 @@ public final class TvActivity extends Activity {
         intent.putExtra("parse", source == null ? "" : source.optString("parse_api"));
         intent.putExtra("sources", detailSources == null ? "[]" : detailSources.toString());
         intent.putExtra("source_index", sourceIndex);
+        int videoId = detailInfo.optInt("vod_id");
+        intent.putExtra("video_id", videoId);
         ArrayList<String> urls = new ArrayList<>();
         ArrayList<String> names = new ArrayList<>();
         int current = 0;
@@ -739,7 +779,16 @@ public final class TvActivity extends Activity {
         intent.putStringArrayListExtra("episode_urls", urls);
         intent.putStringArrayListExtra("episode_names", names);
         intent.putExtra("episode_index", current);
+        JSONObject saved = PlaybackState.load(this, videoId);
+        if (PlaybackState.sourceIndex(detailSources, saved) == sourceIndex
+            && episode.equals(saved.optString("episode_name")))
+            intent.putExtra("resume_ms", saved.optInt("position_ms", 0));
         startActivity(intent);
+    }
+
+    private static String formatTime(int positionMs) {
+        int seconds = Math.max(0, positionMs / 1000);
+        return String.format(java.util.Locale.US, "%02d:%02d", seconds / 60, seconds % 60);
     }
 
     private View poster(JSONObject video, int width, int imageHeight) {

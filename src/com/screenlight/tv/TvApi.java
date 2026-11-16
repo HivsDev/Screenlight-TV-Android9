@@ -1,6 +1,7 @@
-package com.tg666.tv;
+package com.screenlight.tv;
 
 import android.content.Context;
+import android.os.Build;
 import android.util.Base64;
 import android.util.Log;
 
@@ -22,6 +23,7 @@ import java.util.Set;
 
 import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 final class TvApi {
@@ -37,7 +39,7 @@ final class TvApi {
 
     TvApi(Context context) throws Exception {
         this.context = context.getApplicationContext();
-        try (InputStream input = context.getAssets().open("tg_client_key.pk8")) {
+        try (InputStream input = context.getAssets().open("client_key.pk8")) {
             byte[] raw = readAll(input, 4096);
             key = KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(raw));
         }
@@ -114,8 +116,13 @@ final class TvApi {
         System.arraycopy(ciphertext, 0, combined, 0, ciphertext.length);
         System.arraycopy(tag, 0, combined, ciphertext.length, tag.length);
         Cipher aes = Cipher.getInstance("AES/GCM/NoPadding");
-        aes.init(Cipher.DECRYPT_MODE, new SecretKeySpec(aesKey, "AES"),
-            new GCMParameterSpec(128, Base64.decode(envelope.getString("nonce"), Base64.DEFAULT)));
+        byte[] nonce = Base64.decode(envelope.getString("nonce"), Base64.DEFAULT);
+        SecretKeySpec secret = new SecretKeySpec(aesKey, "AES");
+        if (Build.VERSION.SDK_INT < 21) {
+            aes.init(Cipher.DECRYPT_MODE, secret, new IvParameterSpec(nonce));
+        } else {
+            aes.init(Cipher.DECRYPT_MODE, secret, new GCMParameterSpec(128, nonce));
+        }
         return new JSONObject(new String(aes.doFinal(combined), StandardCharsets.UTF_8));
     }
 

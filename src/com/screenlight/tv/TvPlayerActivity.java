@@ -1,4 +1,4 @@
-package com.tg666.tv;
+package com.screenlight.tv;
 
 import android.app.Activity;
 import android.content.res.ColorStateList;
@@ -28,6 +28,7 @@ import java.nio.charset.StandardCharsets;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
@@ -89,16 +90,21 @@ public final class TvPlayerActivity extends Activity {
     private int seekPreviewMs = -1;
     private int seekTargetMs;
     private int resumePositionMs;
+    private int videoId;
+    private long lastSavedAt;
     private Candidate sourceSwitchFallback;
+    private Candidate lastSuccessfulCandidate;
 
     private static final class Candidate {
         final String name;
         final String url;
         final String parser;
-        Candidate(String name, String url, String parser) {
+        final int sourceIndex;
+        Candidate(String name, String url, String parser, int sourceIndex) {
             this.name = name;
             this.url = url;
             this.parser = parser;
+            this.sourceIndex = sourceIndex;
         }
         int priority() {
             if (url.startsWith("http://") || url.startsWith("https://")) return 0;
@@ -109,13 +115,14 @@ public final class TvPlayerActivity extends Activity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        LegacyTls.install(this);
         setTitle("暮光TV");
         getWindow().getDecorView().setSystemUiVisibility(5894 | 1024 | 512);
         getWindow().addFlags(128);
         root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
         root.setFocusableInTouchMode(true);
-        root.setDefaultFocusHighlightEnabled(false);
+        if (android.os.Build.VERSION.SDK_INT >= 26) root.setDefaultFocusHighlightEnabled(false);
         setContentView(root);
         videoLayout = Math.max(0, Math.min(2, getPreferences(0).getInt("video_layout", 1)));
         systemPlayer = new VideoView(this);
@@ -158,6 +165,7 @@ public final class TvPlayerActivity extends Activity {
         if (names == null) names = new ArrayList<>();
         episodeIndex = getIntent().getIntExtra("episode_index", 0);
         selectedSource = getIntent().getIntExtra("source_index", 0);
+        videoId = getIntent().getIntExtra("video_id", 0);
         try { sources = new JSONArray(getIntent().getStringExtra("sources")); }
         catch (Exception error) { sources = new JSONArray(); }
         String fullTitle = getIntent().getStringExtra("title");
@@ -165,7 +173,7 @@ public final class TvPlayerActivity extends Activity {
         int separator = fullTitle.indexOf(" · ");
         titlePrefix = separator < 0 ? fullTitle : fullTitle.substring(0, separator);
         createMenu();
-        playEpisode(episodeIndex);
+        playEpisode(episodeIndex, getIntent().getIntExtra("resume_ms", 0));
         handler.postDelayed(ticker, 1000);
     }
 
@@ -203,7 +211,7 @@ public final class TvPlayerActivity extends Activity {
             ijkPlayer = view;
             root.addView(view, new FrameLayout.LayoutParams(-1, -1));
             view.setVisibility(View.GONE);
-        } catch (Exception error) {
+        } catch (Throwable error) {
             Log.w(TAG, "IJK player unavailable", error);
             ijkPlayer = null;
         }
@@ -217,7 +225,7 @@ public final class TvPlayerActivity extends Activity {
             type.getMethod("setResizeMode", int.class).invoke(exoView, videoLayout == 0 ? 0 : videoLayout == 1 ? 4 : 3);
             root.addView(exoView, new FrameLayout.LayoutParams(-1, -1));
             exoView.setVisibility(View.GONE);
-        } catch (Exception error) {
+        } catch (Throwable error) {
             Log.w(TAG, "ExoPlayer view unavailable", error);
             exoView = null;
         }
@@ -346,8 +354,10 @@ public final class TvPlayerActivity extends Activity {
         if (!inMenu) line.setBackgroundColor(0xD0181D40);
         ProgressBar progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progress.setMax(1000);
-        progress.setProgressTintList(ColorStateList.valueOf(0xFF6FDDE5));
-        progress.setProgressBackgroundTintList(ColorStateList.valueOf(0xFF52606D));
+        if (android.os.Build.VERSION.SDK_INT >= 21) {
+            progress.setProgressTintList(ColorStateList.valueOf(0xFF6FDDE5));
+            progress.setProgressBackgroundTintList(ColorStateList.valueOf(0xFF52606D));
+        }
         line.addView(progress, new LinearLayout.LayoutParams(0, dp(8), 1));
         TextView time = new TextView(this);
         time.setTextColor(Color.WHITE);
@@ -631,7 +641,7 @@ public final class TvPlayerActivity extends Activity {
         JSONObject source = sources.optJSONObject(index);
         if (source == null) return;
         Candidate playing = control != null && control.isPlaying() && currentUrl != null
-            ? new Candidate(currentSource(), currentUrl, "") : null;
+            ? new Candidate(currentSource(), currentUrl, "", currentSourceIndex()) : null;
         String oldName = episodeIndex < names.size() ? names.get(episodeIndex) : "";
         ArrayList<String> newUrls = new ArrayList<>();
         ArrayList<String> newNames = new ArrayList<>();
@@ -644,6 +654,8 @@ public final class TvPlayerActivity extends Activity {
         }
         if (newUrls.isEmpty()) return;
         int position = control == null ? 0 : Math.max(0, control.getCurrentPosition());
+        savePlayback();
+        lastSuccessfulCandidate = null;
         selectedSource = index;
         urls = newUrls;
         names = newNames;
@@ -656,11 +668,14 @@ public final class TvPlayerActivity extends Activity {
     private void handlePrepared(int engine) {
         if (engine != currentEngine || preparedHandled) return;
         preparedHandled = true;
+        if (attemptIndex >= 0 && attemptIndex < candidates.size())
+            lastSuccessfulCandidate = candidates.get(attemptIndex);
         lastProgressMs = -1;
         lastProgressAt = SystemClock.uptimeMillis();
         if (engine == 0) applySpeed();
         if (resumePositionMs > 0) applySeek(resumePositionMs);
         else status.setText("正在播放 · " + currentSource());
+        if (resumePositionMs == 0) savePlayback();
         showOverlay();
     }
 
@@ -681,6 +696,7 @@ public final class TvPlayerActivity extends Activity {
             tryNextEngine();
         } else {
             exhausted = true;
+            savePlayback(0);
             status.setText("播放结束");
             showOverlay();
         }
@@ -692,6 +708,8 @@ public final class TvPlayerActivity extends Activity {
 
     private void playEpisode(int index, int resumeMs) {
         if (index < 0 || index >= urls.size()) return;
+        if (!exhausted) savePlayback();
+        lastSuccessfulCandidate = null;
         episodeIndex = index;
         playGeneration++;
         seekGeneration++;
@@ -718,7 +736,11 @@ public final class TvPlayerActivity extends Activity {
             Candidate candidate = sourceEpisode(i, episode, index);
             if (candidate != null && seen.add(candidate.url)) alternatives.add(candidate);
         }
-        alternatives.sort(Comparator.comparingInt(Candidate::priority));
+        Collections.sort(alternatives, new Comparator<Candidate>() {
+            @Override public int compare(Candidate left, Candidate right) {
+                return left.priority() - right.priority();
+            }
+        });
         candidates.addAll(alternatives);
         if (sourceSwitchFallback != null) {
             Candidate fallback = sourceSwitchFallback;
@@ -728,7 +750,7 @@ public final class TvPlayerActivity extends Activity {
         if (candidates.isEmpty()) {
             String initial = getIntent().getStringExtra("url");
             if (initial != null && !initial.isEmpty())
-                candidates.add(new Candidate("当前线路", initial, getIntent().getStringExtra("parse")));
+                candidates.add(new Candidate("当前线路", initial, getIntent().getStringExtra("parse"), selectedSource));
         }
         attemptIndex = -1;
         nextCandidate();
@@ -753,10 +775,12 @@ public final class TvPlayerActivity extends Activity {
         String url = (parts.length == 2 ? parts[1] : parts[0]).replace("&amp;", "&");
         if (url.isEmpty()) return null;
         return new Candidate(source.optString("name", "线路" + (sourceIndex + 1)),
-            url, source.optString("parse_api"));
+            url, source.optString("parse_api"), sourceIndex);
     }
 
     private void nextCandidate() {
+        savePlayback();
+        lastSuccessfulCandidate = null;
         final int generation = ++playGeneration;
         seeking = false;
         seekPreviewMs = -1;
@@ -831,7 +855,7 @@ public final class TvPlayerActivity extends Activity {
                     tryNextEngine();
                 }
             }, 15000);
-        } catch (Exception error) {
+        } catch (Throwable error) {
             Log.w(TAG, "Playback setup failed: " + currentSource() + ", engine " + engine, error);
             tryNextEngine();
         }
@@ -901,11 +925,29 @@ public final class TvPlayerActivity extends Activity {
             ? candidates.get(attemptIndex).name : "未知线路";
     }
 
+    private int currentSourceIndex() {
+        return lastSuccessfulCandidate != null ? lastSuccessfulCandidate.sourceIndex : selectedSource;
+    }
+
+    private void savePlayback() {
+        if (control == null || exhausted) return;
+        savePlayback(seeking ? seekTargetMs : Math.max(0, control.getCurrentPosition()));
+    }
+
+    private void savePlayback(int positionMs) {
+        if (videoId <= 0 || lastSuccessfulCandidate == null) return;
+        String episode = episodeIndex < names.size() ? names.get(episodeIndex) : "播放";
+        PlaybackState.save(this, videoId, lastSuccessfulCandidate.sourceIndex,
+            lastSuccessfulCandidate.name, episodeIndex, episode, positionMs);
+        lastSavedAt = SystemClock.uptimeMillis();
+    }
+
     private final Runnable ticker = new Runnable() {
         @Override public void run() {
             updateTimeline();
             if (control != null && control.isPlaying()) {
                 int positionMs = Math.max(0, control.getCurrentPosition());
+                if (!seeking && SystemClock.uptimeMillis() - lastSavedAt >= 5000) savePlayback(positionMs);
                 int position = positionMs / 1000;
                 int duration = Math.max(0, control.getDuration() / 1000);
                 if (positionMs > lastProgressMs + 1000) {
@@ -961,6 +1003,7 @@ public final class TvPlayerActivity extends Activity {
             } else {
                 control.pause();
                 paused = true;
+                savePlayback();
                 status.setText("已停止 · " + currentSource());
             }
             showOverlay();
@@ -1036,11 +1079,13 @@ public final class TvPlayerActivity extends Activity {
     }
 
     @Override protected void onPause() {
+        savePlayback();
         if (control != null) control.pause();
         super.onPause();
     }
 
     @Override protected void onDestroy() {
+        savePlayback();
         playGeneration++;
         resolver.shutdownNow();
         handler.removeCallbacks(commitSeek);
