@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory=$true)][string]$AndroidSdk,
     [string]$ApktoolJar = (Join-Path $PSScriptRoot 'tools/apktool.jar'),
     [string]$Keystore = (Join-Path $PSScriptRoot 'signing/screenlight-release.keystore'),
-    [string]$Output = (Join-Path $PSScriptRoot 'Screenlight-TV-v1.9.1-Android4.4plus-32bit-release.apk')
+    [string]$Output = (Join-Path $PSScriptRoot 'Screenlight-TV-v1.9.2-Android4.4plus-32bit-release.apk')
 )
 
 $ErrorActionPreference = 'Stop'

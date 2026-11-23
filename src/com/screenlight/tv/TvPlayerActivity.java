@@ -81,7 +81,16 @@ public final class TvPlayerActivity extends Activity {
     private int episodeIndex;
     private int attemptIndex;
     private int playGeneration;
-    private int seekGeneration;
+    private static final long STARTUP_TIMEOUT_MS = 35000;
+    private static final long BUFFER_TIMEOUT_MS = 45000;
+    private static final long SEEK_TIMEOUT_MS = 25000;
+    private long seekStartedAt;
+    private int seekObservedPosition;
+    private boolean retriedSeek;
+    private boolean backgrounded;
+    private boolean playbackAdvanced;
+    private int confirmedPositionMs = -1;
+    private long engineStartedAt;
     private String titlePrefix;
     private boolean paused;
     private boolean preparedHandled;
@@ -310,7 +319,7 @@ public final class TvPlayerActivity extends Activity {
         };
         exoPlayerType.getMethod("prepare", mediaSourceType).invoke(exoPlayer, mediaSource);
         applySpeed();
-        control.start();
+        if (!paused && !backgrounded) control.start();
     }
 
     private void applySpeed() {
@@ -653,7 +662,7 @@ public final class TvPlayerActivity extends Activity {
             newNames.add(parts.length == 2 ? parts[0] : "播放");
         }
         if (newUrls.isEmpty()) return;
-        int position = control == null ? 0 : Math.max(0, control.getCurrentPosition());
+        int position = Math.max(0, confirmedPositionMs);
         savePlayback();
         lastSuccessfulCandidate = null;
         selectedSource = index;
@@ -668,14 +677,11 @@ public final class TvPlayerActivity extends Activity {
     private void handlePrepared(int engine) {
         if (engine != currentEngine || preparedHandled) return;
         preparedHandled = true;
-        if (attemptIndex >= 0 && attemptIndex < candidates.size())
-            lastSuccessfulCandidate = candidates.get(attemptIndex);
         lastProgressMs = -1;
         lastProgressAt = SystemClock.uptimeMillis();
         if (engine == 0) applySpeed();
         if (resumePositionMs > 0) applySeek(resumePositionMs);
         else status.setText("正在播放 · " + currentSource());
-        if (resumePositionMs == 0) savePlayback();
         showOverlay();
     }
 
@@ -683,6 +689,7 @@ public final class TvPlayerActivity extends Activity {
         if (engine != currentEngine) return;
         Log.w(TAG, "Playback failed: " + what + "/" + extra + ", source " + currentSource()
             + ", engine " + engine);
+        if (seeking && retrySeek()) return;
         tryNextEngine();
     }
 
@@ -692,7 +699,8 @@ public final class TvPlayerActivity extends Activity {
         int position = control.getCurrentPosition();
         if (duration > 0 && position + 30000 < duration) {
             Log.w(TAG, "Playback ended early: " + position + "/" + duration);
-            resumePositionMs = position;
+            if (!seeking) resumePositionMs = Math.max(position, confirmedPositionMs);
+            if (seeking && retrySeek()) return;
             tryNextEngine();
         } else {
             exhausted = true;
@@ -703,16 +711,21 @@ public final class TvPlayerActivity extends Activity {
     }
 
     private void playEpisode(int index) {
-        playEpisode(index, 0);
+        playEpisode(index, 0, currentSourceIndex());
     }
 
     private void playEpisode(int index, int resumeMs) {
+        playEpisode(index, resumeMs, selectedSource);
+    }
+
+    private void playEpisode(int index, int resumeMs, int preferredSource) {
         if (index < 0 || index >= urls.size()) return;
         if (!exhausted) savePlayback();
         lastSuccessfulCandidate = null;
+        confirmedPositionMs = -1;
+        retriedSeek = false;
         episodeIndex = index;
         playGeneration++;
-        seekGeneration++;
         exhausted = false;
         paused = false;
         seeking = false;
@@ -725,14 +738,14 @@ public final class TvPlayerActivity extends Activity {
         updateTimeline();
         candidates.clear();
         Set<String> seen = new HashSet<>();
-        Candidate selected = sourceEpisode(selectedSource, episode, index);
+        Candidate selected = sourceEpisode(preferredSource, episode, index);
         if (selected != null) {
             candidates.add(selected);
             seen.add(selected.url);
         }
         List<Candidate> alternatives = new ArrayList<>();
         for (int i = 0; i < sources.length(); i++) {
-            if (i == selectedSource) continue;
+            if (i == preferredSource) continue;
             Candidate candidate = sourceEpisode(i, episode, index);
             if (candidate != null && seen.add(candidate.url)) alternatives.add(candidate);
         }
@@ -805,7 +818,7 @@ public final class TvPlayerActivity extends Activity {
             return;
         }
         if (candidate.parser == null || candidate.parser.isEmpty()) {
-            handler.post(this::nextCandidate);
+            handler.post(() -> { if (generation == playGeneration) nextCandidate(); });
             return;
         }
         resolver.execute(() -> {
@@ -832,29 +845,25 @@ public final class TvPlayerActivity extends Activity {
     private void startEngine(int engine) {
         int previousEngine = currentEngine;
         currentEngine = engine;
-        int generation = playGeneration;
         int engineTask = ++engineGeneration;
         preparedHandled = false;
+        playbackAdvanced = false;
+        seeking = false;
+        engineStartedAt = SystemClock.uptimeMillis();
         stopEngine(previousEngine);
         if (ijkPlayer != null) ijkPlayer.setVisibility(engine == 0 ? View.VISIBLE : View.GONE);
         systemPlayer.setVisibility(engine == 1 ? View.VISIBLE : View.GONE);
         if (exoView != null) exoView.setVisibility(engine == 2 ? View.VISIBLE : View.GONE);
         applyVideoLayout();
         control = engine == 0 ? (MediaController.MediaPlayerControl) ijkPlayer : engine == 1 ? systemPlayer : null;
-        lastProgressAt = SystemClock.uptimeMillis();
+        lastProgressAt = engineStartedAt;
         lastProgressMs = -1;
         try {
             if (engine == 0) ijkSetPath.invoke(ijkPlayer, currentUrl);
             else if (engine == 1) systemPlayer.setVideoPath(currentUrl);
             else startExoPlayer(currentUrl, engineTask);
-            if (engine != 2) control.start();
-            handler.postDelayed(() -> {
-                if (generation == playGeneration && engineTask == engineGeneration && !paused
-                    && control != null && !control.isPlaying()) {
-                    Log.w(TAG, "Playback startup timed out: " + currentSource() + ", engine " + engine);
-                    tryNextEngine();
-                }
-            }, 15000);
+            if (paused || backgrounded) control.pause();
+            else if (engine != 2) control.start();
         } catch (Throwable error) {
             Log.w(TAG, "Playback setup failed: " + currentSource() + ", engine " + engine, error);
             tryNextEngine();
@@ -862,10 +871,7 @@ public final class TvPlayerActivity extends Activity {
     }
 
     private void tryNextEngine() {
-        if (resumePositionMs == 0 && control != null) {
-            int position = control.getCurrentPosition();
-            if (position > 5000) resumePositionMs = position;
-        }
+        if (!seeking && confirmedPositionMs >= 0) resumePositionMs = confirmedPositionMs;
         if (currentEngine == 0 || currentEngine == 2) {
             status.setText("正在切换播放器 · " + currentSource());
             showOverlay();
@@ -887,37 +893,34 @@ public final class TvPlayerActivity extends Activity {
     }
 
     private final Runnable commitSeek = () -> {
-        if (seekPreviewMs < 0) return;
+        if (seekPreviewMs < 0 || seeking || paused || backgrounded || !preparedHandled) return;
         int target = seekPreviewMs;
         seekPreviewMs = -1;
-        resumePositionMs = target;
+        retriedSeek = false;
         applySeek(target);
-        updateTimeline();
     };
 
     private void applySeek(int target) {
-        final int generation = playGeneration;
-        final int engineTask = engineGeneration;
-        final int seekTask = ++seekGeneration;
-        seeking = true;
-        seekTargetMs = target;
-        updateTimeline();
-        status.setText("正在跳转至 " + format(target / 1000) + " · " + currentSource());
-        showOverlay();
         if (control == null) return;
-        control.seekTo(target);
-        control.start();
-        handler.postDelayed(() -> {
-            if (generation != playGeneration || engineTask != engineGeneration
-                || seekTask != seekGeneration || !seeking || exhausted) return;
-            if (control != null && control.isPlaying() && Math.abs(control.getCurrentPosition() - target) < 15000) {
-                seeking = false;
-                resumePositionMs = 0;
-            } else {
-                Log.w(TAG, "Seek stalled: " + currentSource());
-                tryNextEngine();
-            }
-        }, 12000);
+        int duration = control.getDuration();
+        seekTargetMs = duration > 0 ? Math.min(target, Math.max(0, duration - 3000)) : target;
+        resumePositionMs = seekTargetMs;
+        seeking = true;
+        seekStartedAt = SystemClock.uptimeMillis();
+        seekObservedPosition = -1;
+        status.setText("正在跳转至 " + format(seekTargetMs / 1000) + " · " + currentSource());
+        showOverlay();
+        control.seekTo(seekTargetMs);
+    }
+
+    private boolean retrySeek() {
+        if (retriedSeek || currentEngine < 0 || currentUrl == null) return false;
+        retriedSeek = true;
+        Log.w(TAG, "Retrying seek on current source at " + seekTargetMs);
+        status.setText("正在重试跳转 · " + currentSource());
+        showOverlay();
+        startEngine(currentEngine);
+        return true;
     }
 
     private String currentSource() {
@@ -930,12 +933,11 @@ public final class TvPlayerActivity extends Activity {
     }
 
     private void savePlayback() {
-        if (control == null || exhausted) return;
-        savePlayback(seeking ? seekTargetMs : Math.max(0, control.getCurrentPosition()));
+        if (!exhausted && confirmedPositionMs >= 0) savePlayback(confirmedPositionMs);
     }
 
     private void savePlayback(int positionMs) {
-        if (videoId <= 0 || lastSuccessfulCandidate == null) return;
+        if (videoId <= 0 || lastSuccessfulCandidate == null || positionMs < 0) return;
         String episode = episodeIndex < names.size() ? names.get(episodeIndex) : "播放";
         PlaybackState.save(this, videoId, lastSuccessfulCandidate.sourceIndex,
             lastSuccessfulCandidate.name, episodeIndex, episode, positionMs);
@@ -945,30 +947,55 @@ public final class TvPlayerActivity extends Activity {
     private final Runnable ticker = new Runnable() {
         @Override public void run() {
             updateTimeline();
-            if (control != null && control.isPlaying()) {
-                int positionMs = Math.max(0, control.getCurrentPosition());
-                if (!seeking && SystemClock.uptimeMillis() - lastSavedAt >= 5000) savePlayback(positionMs);
-                int position = positionMs / 1000;
-                int duration = Math.max(0, control.getDuration() / 1000);
-                if (positionMs > lastProgressMs + 1000) {
-                    lastProgressMs = positionMs;
-                    lastProgressAt = SystemClock.uptimeMillis();
-                }
-                if (seeking && Math.abs(position * 1000 - seekTargetMs) < 15000) {
-                    seeking = false;
-                    resumePositionMs = 0;
-                }
-                if (seekPreviewMs < 0 && !seeking)
-                    status.setText(format(position) + " / " + format(duration) + " · " + currentSource());
-            }
-            if (!paused && !exhausted && !seeking && lastProgressAt > 0
-                && SystemClock.uptimeMillis() - lastProgressAt > 20000) {
-                Log.w(TAG, "Playback stalled: " + currentSource() + ", engine " + currentEngine);
-                tryNextEngine();
-            }
+            if (control != null && !paused && !backgrounded && !exhausted) monitorPlayback();
             handler.postDelayed(this, 1000);
         }
     };
+
+    private void monitorPlayback() {
+        long now = SystemClock.uptimeMillis();
+        boolean playing = control.isPlaying();
+        int position = Math.max(0, control.getCurrentPosition());
+        if (seeking) {
+            // Some players report the requested timestamp before decoding resumes.
+            if (playing && seekObservedPosition >= 0 && position > seekObservedPosition + 100
+                && Math.abs(position - seekTargetMs) <= 10000) {
+                seeking = false;
+                resumePositionMs = 0;
+                lastProgressMs = -1;
+                lastProgressAt = now;
+                confirmProgress(position);
+                if (seekPreviewMs >= 0) handler.post(commitSeek);
+            } else {
+                seekObservedPosition = playing ? position : -1;
+                if (now - seekStartedAt >= SEEK_TIMEOUT_MS && !retrySeek()) tryNextEngine();
+                return;
+            }
+        }
+        if (preparedHandled && playing) {
+            if (lastProgressMs >= 0 && position > lastProgressMs + 100) {
+                lastProgressAt = now;
+                confirmProgress(position);
+            }
+            if (lastProgressMs < 0 || position != lastProgressMs) lastProgressMs = position;
+            if (seekPreviewMs < 0) status.setText(format(position / 1000) + " / "
+                + format(Math.max(0, control.getDuration()) / 1000) + " · " + currentSource());
+        }
+        long timeout = preparedHandled || control.getDuration() > 0 ? BUFFER_TIMEOUT_MS : STARTUP_TIMEOUT_MS;
+        long lastActivity = lastProgressAt > 0 ? lastProgressAt : engineStartedAt;
+        if (now - lastActivity >= timeout) {
+            Log.w(TAG, "Playback timed out: " + currentSource() + ", engine " + currentEngine);
+            tryNextEngine();
+        }
+    }
+
+    private void confirmProgress(int position) {
+        if (attemptIndex < 0 || attemptIndex >= candidates.size()) return;
+        lastSuccessfulCandidate = candidates.get(attemptIndex);
+        confirmedPositionMs = position;
+        if (!playbackAdvanced || SystemClock.uptimeMillis() - lastSavedAt >= 3000) savePlayback();
+        playbackAdvanced = true;
+    }
 
     private static String format(int seconds) {
         return String.format(java.util.Locale.US, "%02d:%02d", seconds / 60, seconds % 60);
@@ -999,6 +1026,8 @@ public final class TvPlayerActivity extends Activity {
             if (paused) {
                 control.start();
                 paused = false;
+                lastProgressAt = seekStartedAt = SystemClock.uptimeMillis();
+                if (seekPreviewMs >= 0) handler.post(commitSeek);
                 status.setText("继续播放 · " + currentSource());
             } else {
                 control.pause();
@@ -1018,7 +1047,7 @@ public final class TvPlayerActivity extends Activity {
                 return super.dispatchKeyEvent(event);
             if (code == KeyEvent.KEYCODE_BACK) { hideMenu(); return true; }
             if (code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER) {
-                if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
                     View focused = getCurrentFocus();
                     if (focused != null) focused.performClick();
                 }
@@ -1048,7 +1077,7 @@ public final class TvPlayerActivity extends Activity {
             return true;
         }
         if (code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT) {
-            if (control != null && (control.isPlaying() || seekPreviewMs >= 0 || seeking)) {
+            if (control != null && (preparedHandled || seekPreviewMs >= 0 || seeking)) {
                 int duration = control.getDuration();
                 if (duration <= 0) { showOverlay(); return true; }
                 int delta = code == KeyEvent.KEYCODE_DPAD_RIGHT ? 10000 : -10000;
@@ -1075,10 +1104,20 @@ public final class TvPlayerActivity extends Activity {
 
     @Override public void onBackPressed() {
         if (menuPanel.getVisibility() == View.VISIBLE) hideMenu();
-        else super.onBackPressed();
+        else { savePlayback(); super.onBackPressed(); }
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (!backgrounded) return;
+        backgrounded = false;
+        lastProgressAt = seekStartedAt = SystemClock.uptimeMillis();
+        if (!paused && !exhausted && control != null) control.start();
+        if (seekPreviewMs >= 0) handler.post(commitSeek);
     }
 
     @Override protected void onPause() {
+        backgrounded = true;
         savePlayback();
         if (control != null) control.pause();
         super.onPause();

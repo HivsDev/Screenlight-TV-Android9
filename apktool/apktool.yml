@@ -10,8 +10,8 @@ packageInfo:
   forcedPackageId: 127
   renameManifestPackage: com.screenlight.tv
 versionInfo:
-  versionCode: 126
-  versionName: 1.9.1
+  versionCode: 127
+  versionName: 1.9.2
 doNotCompress:
 - arsc
 - jpg

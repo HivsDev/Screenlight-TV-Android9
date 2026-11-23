@@ -44,14 +44,24 @@ final class PlaybackState {
     }
 
     static int episodeIndex(String[] entries, JSONObject state) {
+        return episodeIndex(entries, state, true);
+    }
+
+    static int episodeIndex(String[] entries, JSONObject state, boolean encodedEntries) {
+        int index = state.optInt("episode_index", 0);
         String name = state.optString("episode_name", "");
+        if (index >= 0 && index < entries.length && name.equals(episodeName(entries[index], encodedEntries))) return index;
         if (!name.isEmpty()) {
             for (int i = 0; i < entries.length; i++) {
-                String[] parts = entries[i].split("\\$", 2);
-                if (parts.length == 2 && name.equals(parts[0])) return i;
+                if (name.equals(episodeName(entries[i], encodedEntries))) return i;
             }
         }
-        int index = state.optInt("episode_index", 0);
         return index >= 0 && index < entries.length ? index : 0;
+    }
+
+    private static String episodeName(String entry, boolean encoded) {
+        if (!encoded) return entry;
+        int separator = entry.indexOf('$');
+        return separator < 0 ? "播放" : entry.substring(0, separator);
     }
 }
